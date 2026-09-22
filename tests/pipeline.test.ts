@@ -84,6 +84,37 @@ describe('end-to-end analysis pipeline', () => {
     expect(retried.error).toBeNull();
   });
 
+  it('gives a manual retry a fresh attempt budget, not the exhausted one', async () => {
+    // Regression: retry() used to clear last_error but keep `attempts`, so an
+    // item that had burned its budget got exactly ONE attempt per retry and no
+    // automatic backoff — which is not what pressing "retry" is taken to mean.
+    let calls = 0;
+    const rateLimited: AnalysisProvider = {
+      name: 'rate-limited',
+      analyze: async () => {
+        calls += 1;
+        throw new ProviderError('429 slow down', 'rate_limit');
+      },
+    };
+
+    app = makeApp(rateLimited); // MAX_ANALYSIS_ATTEMPTS = 3
+
+    const submitted = app.service.submit('this will be rate limited');
+    await settle(app);
+    expect(app.service.get(submitted.id).status).toBe('FAILED');
+    expect(app.service.get(submitted.id).attempts).toBe(3);
+    expect(calls).toBe(3);
+
+    calls = 0;
+    const retried = app.service.retry(submitted.id);
+    expect(retried.attempts).toBe(0); // counter reset on acceptance
+
+    await settle(app);
+    // A full budget again, not a single shot.
+    expect(calls).toBe(3);
+    expect(app.service.get(submitted.id).attempts).toBe(3);
+  });
+
   it('rejects a retry on anything that is not FAILED', async () => {
     app = makeApp(new FakeProvider());
 
