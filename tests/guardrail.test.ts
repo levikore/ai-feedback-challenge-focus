@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { FakeProvider } from '../src/ai/fakeProvider.js';
+import { ProviderError, type AnalysisProvider } from '../src/ai/provider.js';
 import type { App } from '../src/app.js';
 import { makeApp, settle } from './helpers.js';
 
@@ -60,6 +61,79 @@ describe('guardrail: hash-based analysis cache', () => {
 
     expect(provider.callCount).toBe(2);
     expect(app.service.get(other.id).analysis!.from_cache).toBe(false);
+  });
+
+  it('collapses a burst of identical feedback into ONE model call', async () => {
+    // The regression this exists for: findCacheSource only matches DONE rows,
+    // so before the leader/follower fan-out every duplicate arriving while the
+    // first analysis was still running bought its own LLM call. With a 150ms
+    // provider this test saw 6 calls; it must see 1.
+    let calls = 0;
+    const slow: AnalysisProvider = {
+      name: 'slow',
+      analyze: async () => {
+        calls += 1;
+        await new Promise((r) => setTimeout(r, 150));
+        return {
+          raw: JSON.stringify({
+            sentiment: 'negative',
+            feature_requests: [],
+            actionable_insight: 'Investigate the outage.',
+          }),
+          model: 'slow',
+        };
+      },
+    };
+
+    app = makeApp(slow, { WORKER_CONCURRENCY: '4' });
+
+    const burst = Array.from({ length: 6 }, () =>
+      app!.service.submit('Everything is down right now!'),
+    );
+    await settle(app);
+
+    expect(calls).toBe(1);
+
+    const views = burst.map((b) => app!.service.get(b.id));
+    expect(views.every((v) => v.status === 'DONE')).toBe(true);
+    expect(views.every((v) => v.analysis!.sentiment === 'negative')).toBe(true);
+
+    // Exactly one did the work; the other five inherited it.
+    expect(views.filter((v) => v.analysis!.from_cache === false)).toHaveLength(1);
+    expect(views.filter((v) => v.analysis!.from_cache === true)).toHaveLength(5);
+  });
+
+  it('promotes a waiting duplicate when the leader fails, one at a time', async () => {
+    let calls = 0;
+    const failsTwiceThenWorks: AnalysisProvider = {
+      name: 'flaky',
+      analyze: async () => {
+        calls += 1;
+        await new Promise((r) => setTimeout(r, 50));
+        if (calls <= 2) throw new ProviderError('bad shape', 'malformed_output');
+        return {
+          raw: JSON.stringify({
+            sentiment: 'neutral',
+            feature_requests: [],
+            actionable_insight: 'Fine in the end.',
+          }),
+          model: 'flaky',
+        };
+      },
+    };
+
+    app = makeApp(failsTwiceThenWorks, { WORKER_CONCURRENCY: '4', MAX_ANALYSIS_ATTEMPTS: '1' });
+
+    const burst = Array.from({ length: 4 }, () => app!.service.submit('same text, flaky backend'));
+    await settle(app);
+
+    // Leader fails, one follower is promoted and fails, the next succeeds and
+    // fans out to whatever is left. Crucially NOT 4 simultaneous calls.
+    expect(calls).toBe(3);
+
+    const views = burst.map((b) => app!.service.get(b.id));
+    expect(views.filter((v) => v.status === 'FAILED')).toHaveLength(2);
+    expect(views.filter((v) => v.status === 'DONE')).toHaveLength(2);
   });
 
   it('does not serve a cache hit from feedback that failed analysis', async () => {

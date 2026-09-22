@@ -51,8 +51,12 @@ export class FeedbackRepository {
   }
 
   /**
-   * The most recent feedback with this content hash that already has a
-   * validated analysis. Backs the dedup/cache guardrail.
+   * The earliest feedback with this content hash that already has a validated
+   * analysis. Backs the dedup/cache guardrail.
+   *
+   * Oldest rather than newest on purpose: it is stable. Every duplicate of a
+   * given text inherits the same analysis for the lifetime of the table,
+   * instead of the answer drifting as later duplicates arrive.
    */
   findCacheSource(contentHash: string): FeedbackRow | undefined {
     return this.db
@@ -64,6 +68,46 @@ export class FeedbackRepository {
           LIMIT 1`,
       )
       .get(contentHash) as FeedbackRow | undefined;
+  }
+
+  /**
+   * Another submission of the same text whose analysis has not finished yet.
+   *
+   * This is what closes the gap the DONE-only cache lookup leaves open: between
+   * the moment the first copy is submitted and the moment its analysis lands,
+   * `findCacheSource` finds nothing, so without this every duplicate in that
+   * window would buy its own LLM call. Against a real model that window is
+   * seconds wide, which is exactly when bursts of identical feedback arrive.
+   */
+  findInFlightByHash(contentHash: string, excludeId: string): FeedbackRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM feedback
+          WHERE content_hash = ?
+            AND id != ?
+            AND status IN ('RECEIVED', 'ANALYZING')
+          ORDER BY created_at ASC
+          LIMIT 1`,
+      )
+      .get(contentHash, excludeId) as FeedbackRow | undefined;
+  }
+
+  /**
+   * Submissions of the same text that are waiting on someone else's analysis.
+   *
+   * These were deliberately never queued (see FeedbackService.submit), so no
+   * worker owns them and it is safe to transition them in bulk.
+   */
+  findFollowers(contentHash: string, excludeId: string): FeedbackRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM feedback
+          WHERE content_hash = ?
+            AND id != ?
+            AND status = 'RECEIVED'
+          ORDER BY created_at ASC`,
+      )
+      .all(contentHash, excludeId) as FeedbackRow[];
   }
 
   list({ status, limit, offset }: ListOptions): FeedbackRow[] {
@@ -103,7 +147,12 @@ export class FeedbackRepository {
     id: string,
     from: FeedbackStatus,
     to: FeedbackStatus,
-    opts: { incrementAttempts?: boolean; lastError?: string | null } = {},
+    opts: {
+      incrementAttempts?: boolean;
+      /** Zeroes the attempt counter, giving the item a fresh retry budget. */
+      resetAttempts?: boolean;
+      lastError?: string | null;
+    } = {},
   ): boolean {
     if (!isLegalTransition(from, to)) {
       throw new Error(`Illegal state transition requested: ${from} -> ${to}`);
@@ -114,7 +163,8 @@ export class FeedbackRepository {
         `UPDATE feedback
             SET status     = @to,
                 updated_at = @updated_at,
-                attempts   = attempts + @attemptDelta,
+                attempts   = CASE WHEN @resetAttempts = 1 THEN 0
+                                  ELSE attempts + @attemptDelta END,
                 last_error = @lastError
           WHERE id = @id AND status = @from`,
       )
@@ -124,6 +174,7 @@ export class FeedbackRepository {
         to,
         updated_at: nowIso(),
         attemptDelta: opts.incrementAttempts ? 1 : 0,
+        resetAttempts: opts.resetAttempts ? 1 : 0,
         lastError: opts.lastError ?? null,
       });
 
@@ -151,10 +202,27 @@ export class FeedbackRepository {
     return stranded.map((r) => r.id);
   }
 
-  /** Every item still awaiting analysis, oldest first. Used to refill the queue at boot. */
+  /**
+   * Items to re-queue at boot: the oldest pending row per distinct content.
+   *
+   * One per hash rather than all of them, to preserve the leader/follower rule
+   * across a restart. Queueing every RECEIVED row would hand the same text to
+   * several workers at once and reintroduce exactly the duplicate spend the
+   * guardrail exists to prevent. The rest are picked up by the fan-out when
+   * their leader completes, or promoted if it fails.
+   */
   findPendingIds(): string[] {
     const rows = this.db
-      .prepare(`SELECT id FROM feedback WHERE status = 'RECEIVED' ORDER BY created_at ASC`)
+      .prepare(
+        `SELECT id FROM feedback
+          WHERE status = 'RECEIVED'
+            AND created_at = (
+              SELECT MIN(f2.created_at) FROM feedback f2
+               WHERE f2.content_hash = feedback.content_hash AND f2.status = 'RECEIVED'
+            )
+          GROUP BY content_hash
+          ORDER BY created_at ASC`,
+      )
       .all() as Array<{ id: string }>;
     return rows.map((r) => r.id);
   }

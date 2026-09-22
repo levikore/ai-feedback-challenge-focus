@@ -1,7 +1,7 @@
 import type { Analyzer } from '../ai/analyzer.js';
 import { ProviderError } from '../ai/provider.js';
 import type { Analysis } from '../domain/analysisSchema.js';
-import type { FeedbackRow, FeedbackStatus } from '../domain/feedback.js';
+import type { AnalysisRow, FeedbackRow, FeedbackStatus } from '../domain/feedback.js';
 import type { AnalysisQueue } from '../queue/analysisQueue.js';
 import type { AnalysisRepository } from '../repositories/analysisRepository.js';
 import type { FeedbackRepository } from '../repositories/feedbackRepository.js';
@@ -84,6 +84,20 @@ export class FeedbackService {
         `Cache source ${cacheSource.id} holds an analysis that failed re-validation; re-analysing ${row.id}.`,
       );
     }
+
+    // No finished analysis to copy — but an identical submission may already be
+    // on its way through. If so this row becomes a *follower*: it is created
+    // and left RECEIVED, and deliberately NOT queued. The in-flight leader's
+    // result is fanned out to it on completion.
+    //
+    // Without this, the cache only helps once the first analysis has landed,
+    // so a burst of identical feedback — the case the guardrail exists for —
+    // would buy one LLM call per submission.
+    const leader = feedback.findInFlightByHash(row.content_hash, row.id);
+    if (leader) {
+      logger.info(`${row.id} is a duplicate of in-flight ${leader.id}; awaiting its result.`);
+      return this.view(row);
+    }
     // ------------------------------------------------------------------------
 
     queue.enqueue(row.id);
@@ -103,11 +117,15 @@ export class FeedbackService {
     offset: number;
   } {
     const rows = this.deps.feedback.list(opts);
-    // One query for all analyses rather than one per row.
+    // One query for all analyses rather than one per row. The map is passed
+    // down whole rather than per-row: a row with no analysis yields `undefined`
+    // from .get(), which is indistinguishable from "nothing was preloaded" and
+    // used to send view() back to the database for every RECEIVED or FAILED
+    // item — turning this into limit+1 queries for exactly those pages.
     const analysisRows = this.deps.analyses.findByFeedbackIds(rows.map((r) => r.id));
 
     return {
-      items: rows.map((row) => this.view(row, analysisRows.get(row.id))),
+      items: rows.map((row) => this.view(row, analysisRows)),
       total: this.deps.feedback.count(opts.status),
       limit: opts.limit,
       offset: opts.offset,
@@ -124,7 +142,15 @@ export class FeedbackService {
 
     // If this loses the race, another retry already requeued the item and
     // there is nothing left to do.
-    const claimed = feedback.transition(id, 'FAILED', 'RECEIVED', { lastError: null });
+    // resetAttempts: a manual retry is a deliberate act by an operator who has
+    // usually just fixed something — waited out a rate-limit window, restored a
+    // credential. Carrying the exhausted counter over would give that retry a
+    // single attempt and no backoff, which is not what "retry" means to anyone
+    // pressing the button.
+    const claimed = feedback.transition(id, 'FAILED', 'RECEIVED', {
+      resetAttempts: true,
+      lastError: null,
+    });
 
     // Snapshot before enqueueing. A worker can claim the item the instant it
     // is queued, and a response that says ANALYZING or even DONE depending on
@@ -176,6 +202,8 @@ export class FeedbackService {
       feedback.transition(feedbackId, 'ANALYZING', 'DONE', { lastError: null });
 
       logger.info(`Analysed ${feedbackId} in ${outcome.durationMs}ms (${outcome.model}).`);
+
+      this.fanOutToFollowers(row, outcome.analysis, outcome.model);
     } catch (error) {
       const providerError =
         error instanceof ProviderError
@@ -220,11 +248,56 @@ export class FeedbackService {
       logger.error(
         `Analysis of ${feedbackId} failed permanently (${providerError.kind}): ${providerError.message}`,
       );
+
+      this.promoteFollower(row);
     }
   }
 
-  private view(row: FeedbackRow, preloaded?: ReturnType<AnalysisRepository['findByFeedbackId']>): FeedbackView {
-    const analysisRow = preloaded ?? this.deps.analyses.findByFeedbackId(row.id);
+  /**
+   * Copies a completed analysis onto every duplicate that was waiting on it.
+   *
+   * Followers were never queued, so no worker owns them and transitioning them
+   * here cannot race anything. They are marked `from_cache` for the same reason
+   * an ordinary cache hit is: the saving should be visible, not invisible.
+   */
+  private fanOutToFollowers(leader: FeedbackRow, analysis: Analysis, model: string): void {
+    const { feedback, analyses, logger } = this.deps;
+
+    const followers = feedback.findFollowers(leader.content_hash, leader.id);
+    if (followers.length === 0) return;
+
+    for (const follower of followers) {
+      analyses.saveAnalysis(follower.id, analysis, model, true);
+      // RECEIVED -> DONE directly: no analysis ran for this row.
+      feedback.transition(follower.id, 'RECEIVED', 'DONE');
+    }
+
+    logger.info(
+      `Fanned ${leader.id}'s analysis out to ${followers.length} waiting duplicate(s); ` +
+        `${followers.length} LLM call(s) avoided.`,
+    );
+  }
+
+  /**
+   * Hands leadership to a waiting duplicate after the leader failed.
+   *
+   * Exactly one is promoted, not all of them: the rest stay followers behind
+   * the new leader. If that one fails too, this runs again, so the chain
+   * degrades one attempt at a time instead of stampeding the provider with the
+   * very input that just failed.
+   */
+  private promoteFollower(failed: FeedbackRow): void {
+    const { feedback, queue, logger } = this.deps;
+
+    const next = feedback.findFollowers(failed.content_hash, failed.id)[0];
+    if (!next) return;
+
+    logger.info(`Promoting duplicate ${next.id} after ${failed.id} failed.`);
+    queue.enqueue(next.id);
+  }
+
+  private view(row: FeedbackRow, preloaded?: Map<string, AnalysisRow>): FeedbackView {
+    const analysisRow = preloaded ? preloaded.get(row.id) : this.deps.analyses.findByFeedbackId(row.id);
     const analysis = analysisRow ? this.deps.analyses.toAnalysis(analysisRow) : null;
 
     return {
