@@ -68,8 +68,15 @@ export class AnalysisQueue {
       }
     }, delayMs);
 
-    // Do not hold the event loop open purely for a pending retry.
-    timer.unref?.();
+    // Deliberately NOT unref'd. An unref'd timer lets the event loop drain
+    // while a retry is still pending, so the process exits and the retry is
+    // silently dropped. In the HTTP server that was masked by the listening
+    // socket; anywhere else (a CLI drain, a batch job, a future worker process)
+    // it lost work. A pending retry is real outstanding work and should keep
+    // the process alive exactly like an in-flight job does.
+    //
+    // This cannot delay shutdown, because drain() clears these timers rather
+    // than awaiting them.
     this.scheduled.add(timer);
   }
 
