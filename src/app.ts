@@ -1,6 +1,7 @@
 import { Analyzer } from './ai/analyzer.js';
 import { AnthropicProvider } from './ai/anthropicProvider.js';
 import { FakeProvider } from './ai/fakeProvider.js';
+import { GeminiProvider } from './ai/geminiProvider.js';
 import type { AnalysisProvider } from './ai/provider.js';
 import type { Config } from './config.js';
 import { openDatabase, type Db } from './db/connection.js';
@@ -33,28 +34,44 @@ export interface WireOptions {
  * module-level singletons, which is precisely why the tests can stand up a
  * complete, isolated application against an in-memory database in three lines.
  */
+/**
+ * Instantiates the configured analysis backend.
+ *
+ * The only place in the application that knows more than one provider exists.
+ * Everything downstream sees an `AnalysisProvider` and nothing else.
+ */
+function buildProvider(config: Config, logger: ServiceLogger): AnalysisProvider {
+  switch (config.resolvedProvider) {
+    case 'gemini':
+      return new GeminiProvider(
+        config.GEMINI_API_KEY!,
+        config.GEMINI_MODEL,
+        config.GEMINI_MAX_TOKENS,
+      );
+
+    case 'anthropic':
+      return new AnthropicProvider(
+        config.ANTHROPIC_API_KEY!,
+        config.ANTHROPIC_MODEL,
+        config.ANTHROPIC_MAX_TOKENS,
+      );
+
+    case 'fake':
+      logger.warn(
+        'No GEMINI_API_KEY or ANTHROPIC_API_KEY found — running on the deterministic ' +
+          'FakeProvider. Analyses are SIMULATED, not produced by a model.',
+      );
+      return new FakeProvider();
+  }
+}
+
 export function wireApp({ config, logger, provider }: WireOptions): App {
   const db = openDatabase(config.DATABASE_PATH);
 
   const feedbackRepo = new FeedbackRepository(db);
   const analysisRepo = new AnalysisRepository(db);
 
-  const resolvedProvider =
-    provider ??
-    (config.useFakeProvider
-      ? new FakeProvider()
-      : new AnthropicProvider(
-          config.ANTHROPIC_API_KEY!,
-          config.ANTHROPIC_MODEL,
-          config.ANTHROPIC_MAX_TOKENS,
-        ));
-
-  if (!provider && config.useFakeProvider) {
-    logger.warn(
-      'No ANTHROPIC_API_KEY found — running on the deterministic FakeProvider. ' +
-        'Analyses are simulated, not real.',
-    );
-  }
+  const resolvedProvider = provider ?? buildProvider(config, logger);
 
   const analyzer = new Analyzer(resolvedProvider);
 
