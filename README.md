@@ -12,19 +12,39 @@ Built for the AI-Assisted Engineering Challenge. Node.js + TypeScript.
 
 ```bash
 npm install
-npm run dev
+GEMINI_API_KEY=your-key npm run dev
 ```
 
-That is the whole setup. **No API key is required.** With `ANTHROPIC_API_KEY`
-unset the app runs on a deterministic `FakeProvider` and every path in the
-system — analysis, caching, validation failure, retry — works and is
-demonstrable. Set the key to use the real model:
+A **free** Gemini key takes about a minute to get and needs no credit card:
+[aistudio.google.com](https://aistudio.google.com) → *Get API key* → *Create API
+key*. (Users in the EEA, UK or Switzerland must enable billing even for
+free-tier models.)
 
-```bash
-cp .env.example .env    # then fill in ANTHROPIC_API_KEY
-```
+### Providers
 
-Environment variables are documented in [`.env.example`](.env.example).
+The LLM sits behind a two-method interface, and three implementations satisfy it:
+
+| `AI_PROVIDER` | Key | Notes |
+|---|---|---|
+| `gemini` | `GEMINI_API_KEY` | Free tier. Structured output via a response schema. |
+| `anthropic` | `ANTHROPIC_API_KEY` | Paid. Structured output via forced tool use. |
+| `fake` | none | Deterministic stand-in. **Simulated, not a model.** |
+
+`auto` (the default) uses Gemini if its key is present, then Anthropic, then
+falls back to the fake provider — so `npm install && npm run dev` works with no
+credentials at all, and the full system including every failure path can be
+exercised for free.
+
+Naming a provider explicitly is honoured, and the app **refuses to start** if
+that provider's key is missing. Asking for a real model and silently getting a
+simulated one is the worst available outcome, so it is a startup failure rather
+than a quiet downgrade.
+
+Two real providers is not decoration: it is what demonstrates the interface does
+real work. They reach structured output by different routes — a response schema
+versus forced tool use — and nothing above `src/ai/` changes between them.
+
+All configuration is documented in [`.env.example`](.env.example).
 
 ### See it work
 
@@ -33,12 +53,17 @@ npm run dev             # terminal 1
 ./scripts/demo.sh       # terminal 2
 ```
 
-`scripts/demo.sh` walks the entire system end to end: async submission, a cache
+`scripts/demo.sh` detects which provider is running and adapts: against a real
+model it shows genuine analyses, and against the deterministic provider it also
+injects the failure and retry paths, which a real model cannot be made to produce
+on demand. Run it both ways to see everything.
+
+It walks the entire system end to end: async submission, a cache
 hit, a schema-validation failure, a manual retry, automatic retry of a transient
 failure, and the read API. It is the intended script for the screen recording.
 
 ```bash
-npm test                # 50 tests, no key required
+npm test                # 67 tests, no key required
 npm run typecheck
 ```
 
@@ -123,20 +148,27 @@ exactly what the model returned and exactly why it was rejected.
 
 ### Forcing structure, then validating it anyway
 
-The request uses **forced tool use** (`tool_choice: {type: "tool"}`) with the
-JSON schema as the tool's `input_schema`, rather than asking for JSON in prose.
-That removes markdown fences, preambles and trailing commentary as failure
-modes at the source.
+Neither provider is asked for JSON in prose. Both are constrained at generation
+time, by whichever mechanism that API offers:
 
-The output is **still** validated with Zod afterwards. A constrained decode is a
-strong prior, not a guarantee, and the brief requires explicit validation.
-The Zod schema is `.strict()`: an unexpected key means the model answered a
-different question than the one asked, and silently dropping it would hide that.
+- **Anthropic** — forced tool use (`tool_choice: {type: "tool"}`) with the JSON
+  Schema as the tool's `input_schema`.
+- **Gemini** — `responseMimeType: "application/json"` plus `responseJsonSchema`.
 
-The tool's JSON Schema is written by hand rather than generated from the Zod
-schema — deliberately. They serve different purposes: one shapes generation, the
-other decides what gets stored. Deriving the gate from the hint would let a
-single conversion bug weaken both at once.
+Both consume the *same* hand-written JSON Schema, so the two providers are held
+to one contract. This removes markdown fences, preambles and trailing commentary
+as failure modes at the source.
+
+The output is **still** validated with Zod afterwards, on both paths. A
+constrained decode is a strong prior, not a guarantee, and the brief requires
+explicit validation. The Zod schema is `.strict()`: an unexpected key means the
+model answered a different question than the one asked, and silently dropping it
+would hide that.
+
+The JSON Schema sent to the models is written by hand rather than generated from
+the Zod schema — deliberately. They serve different purposes: one shapes
+generation, the other decides what gets stored. Deriving the gate from the hint
+would let a single conversion bug weaken both at once.
 
 ### Retry policy distinguishes "unlucky" from "wrong"
 
@@ -239,7 +271,7 @@ Conscious omissions, not oversights:
 | Durable queue | In-process, which the brief permits. The DB-as-source-of-truth design is what keeps the swap to SQS/Redis cheap. |
 | Auth, rate limiting, deployment | Explicitly out of scope per the brief. |
 | Structured log shipping, metrics | Fastify's logger only. `analysis_attempts` already holds the latency and failure data a dashboard would need. |
-| Exhaustive tests | 50 tests aimed at what carries risk — the state machine, the schema gate, the failure taxonomy, the guardrail. The brief says coverage is not graded, so I spent the budget on the paths where a bug would be silent. |
+| Exhaustive tests | 67 tests aimed at what carries risk — the state machine, the schema gate, the failure taxonomy, the guardrail. The brief says coverage is not graded, so I spent the budget on the paths where a bug would be silent. |
 | Dead-letter handling beyond `FAILED` | `FAILED` + an explicit retry endpoint covers the requirement. A real system would alert on the `FAILED` count. |
 
 ## What I would do with more time
