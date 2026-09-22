@@ -1,3 +1,9 @@
+// Loads .env into process.env before anything reads config. Imported first,
+// and for its side effect only — config.ts still owns parsing and validation.
+// Real environment variables always win over the file, so a value exported in
+// the shell is not silently overridden by a stale .env.
+import 'dotenv/config';
+
 import { wireApp } from './app.js';
 import { loadConfig } from './config.js';
 import { buildServer } from './http/server.js';
