@@ -1,0 +1,32 @@
+{
+  "name": "ai-feedback-challenge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Backend that ingests free-text feedback and asynchronously extracts structured insights with an LLM.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json && cp src/db/schema.sql dist/src/db/schema.sql",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "demo": "./scripts/demo.sh"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.69.0",
+    "better-sqlite3": "^12.2.0",
+    "fastify": "^5.6.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.18.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
