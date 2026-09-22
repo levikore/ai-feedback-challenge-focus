@@ -8,6 +8,9 @@ Built for the AI-Assisted Engineering Challenge. Node.js + TypeScript.
 
 ---
 
+## Demo:
+https://drive.google.com/file/d/18FPcX4TP4-Z-1iUHPhDOJ2nrS5iRUEBp/view?usp=drive_web
+
 ## Setup
 
 ```bash
