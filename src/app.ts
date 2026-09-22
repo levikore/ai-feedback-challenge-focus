@@ -43,7 +43,11 @@ export function wireApp({ config, logger, provider }: WireOptions): App {
     provider ??
     (config.useFakeProvider
       ? new FakeProvider()
-      : new AnthropicProvider(config.ANTHROPIC_API_KEY!, config.ANTHROPIC_MODEL));
+      : new AnthropicProvider(
+          config.ANTHROPIC_API_KEY!,
+          config.ANTHROPIC_MODEL,
+          config.ANTHROPIC_MAX_TOKENS,
+        ));
 
   if (!provider && config.useFakeProvider) {
     logger.warn(

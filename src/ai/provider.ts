@@ -28,6 +28,7 @@ export type ProviderErrorKind =
   | 'transient' // 5xx, timeout, connection reset — retry
   | 'auth' // 401/403 — a human must fix the credentials
   | 'invalid_request' // 400/404 — our request or model id is wrong
+  | 'truncated' // the model was cut off by max_tokens mid-answer
   | 'malformed_output'; // the model answered, but not in the agreed shape
 
 export class ProviderError extends Error {
@@ -49,6 +50,10 @@ export class ProviderError extends Error {
    * so the same input produces the same bad shape and a retry only burns tokens
    * to reach the same conclusion more slowly. Fixing it requires a prompt or
    * schema change, which is a deploy, not a retry.
+   *
+   * `truncated` is not retryable for the same reason, and is kept distinct from
+   * `malformed_output` because the fix is completely different: raise the token
+   * ceiling, rather than go looking for a bug in the prompt or the schema.
    */
   get retryable(): boolean {
     return this.kind === 'rate_limit' || this.kind === 'transient';

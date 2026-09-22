@@ -5,6 +5,16 @@ import { ProviderError } from './provider.js';
 
 const TOOL_NAME = 'record_analysis';
 
+/**
+ * Default output ceiling for one analysis, overridable via ANTHROPIC_MAX_TOKENS.
+ *
+ * The schema permits up to 20 feature requests (titles to 200 chars) plus a
+ * 1000-char insight, which is roughly 1800 tokens of JSON in the worst case —
+ * so the original 1024 could truncate a legitimately long answer. 4096 leaves
+ * headroom at no cost: billing is on tokens actually generated, not on the cap.
+ */
+export const DEFAULT_MAX_TOKENS = 4096;
+
 const SYSTEM_PROMPT = [
   'You analyse a single piece of end-user product feedback.',
   '',
@@ -30,6 +40,7 @@ export class AnthropicProvider implements AnalysisProvider {
   constructor(
     apiKey: string,
     private readonly model: string,
+    private readonly maxTokens: number = DEFAULT_MAX_TOKENS,
   ) {
     this.name = model;
     // maxRetries: 0 — retry policy belongs to the worker, which owns the
@@ -44,7 +55,7 @@ export class AnthropicProvider implements AnalysisProvider {
     try {
       response = await this.client.messages.create({
         model: this.model,
-        max_tokens: 1024,
+        max_tokens: this.maxTokens,
         system: SYSTEM_PROMPT,
         // Forcing the tool call is what removes the whole class of
         // "model wrapped the JSON in a markdown fence" parsing failures.
@@ -68,27 +79,58 @@ export class AnthropicProvider implements AnalysisProvider {
       throw toProviderError(error);
     }
 
-    const toolUse = response.content.find(
-      (block): block is Anthropic.ToolUseBlock =>
-        block.type === 'tool_use' && block.name === TOOL_NAME,
-    );
-
-    if (!toolUse) {
-      // Forced tool use should make this impossible. It is handled anyway
-      // because "should be impossible" is not a runtime guarantee — and the
-      // raw response is carried through so the failure is diagnosable.
-      throw new ProviderError(
-        `Model did not call ${TOOL_NAME} (stop_reason: ${response.stop_reason}).`,
-        'malformed_output',
-        JSON.stringify(response.content),
-      );
-    }
-
-    // Serialised rather than passed as an object: the raw column stores exactly
-    // what the model produced, and the validator downstream parses it the same
-    // way for every provider.
-    return { raw: JSON.stringify(toolUse.input), model: this.model };
+    return interpretResponse(response, this.model, this.maxTokens);
   }
+}
+
+/**
+ * Turns a Messages API response into a ProviderResult, or an error explaining
+ * why it cannot be one.
+ *
+ * Exported and free of any client so it can be unit-tested against the exact
+ * response shapes that matter — truncation, a missing tool call — without a
+ * network round trip or an API key.
+ */
+export function interpretResponse(
+  response: Anthropic.Message,
+  model: string,
+  maxTokens: number = DEFAULT_MAX_TOKENS,
+): { raw: string; model: string } {
+  const toolUse = response.content.find(
+    (block): block is Anthropic.ToolUseBlock =>
+      block.type === 'tool_use' && block.name === TOOL_NAME,
+  );
+
+  // Checked BEFORE the tool block is used. A generation cut off by the token
+  // ceiling still yields a tool_use block, but with input the model never
+  // finished writing. Without this check that truncated input is either stored
+  // as a silently incomplete analysis, or fails Zod validation with a
+  // "schema validation" error that sends whoever reads it hunting for a bug in
+  // the prompt when the actual cause is the token limit.
+  if (response.stop_reason === 'max_tokens') {
+    throw new ProviderError(
+      `Model output was truncated by max_tokens (${maxTokens}) before the analysis was complete. ` +
+        'Raise ANTHROPIC_MAX_TOKENS or shorten the feedback.',
+      'truncated',
+      toolUse ? JSON.stringify(toolUse.input) : JSON.stringify(response.content),
+    );
+  }
+
+  if (!toolUse) {
+    // Forced tool use should make this impossible. It is handled anyway
+    // because "should be impossible" is not a runtime guarantee — and the
+    // raw response is carried through so the failure is diagnosable.
+    throw new ProviderError(
+      `Model did not call ${TOOL_NAME} (stop_reason: ${response.stop_reason}).`,
+      'malformed_output',
+      JSON.stringify(response.content),
+    );
+  }
+
+  // Serialised rather than passed as an object: the raw column stores exactly
+  // what the model produced, and the validator downstream parses it the same
+  // way for every provider.
+  return { raw: JSON.stringify(toolUse.input), model };
 }
 
 /**

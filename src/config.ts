@@ -15,6 +15,7 @@ const EnvSchema = z.object({
   DATABASE_PATH: z.string().min(1).default('./data/feedback.db'),
   ANTHROPIC_API_KEY: z.string().min(1).optional(),
   ANTHROPIC_MODEL: z.string().min(1).default('claude-opus-5'),
+  ANTHROPIC_MAX_TOKENS: numeric(4096, 256, 64_000),
   WORKER_CONCURRENCY: numeric(2, 1, 32),
   MAX_ANALYSIS_ATTEMPTS: numeric(3, 1, 10),
   MAX_FEEDBACK_LENGTH: numeric(5000, 1, 100_000),
