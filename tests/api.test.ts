@@ -71,6 +71,34 @@ describe('HTTP API', () => {
     expect(res.statusCode).toBe(400);
   });
 
+  it('returns 400, not 500, for a malformed JSON body', async () => {
+    // Regression: the error handler flattened every error to 500, including
+    // Fastify's own parse errors, which carry a 4xx statusCode.
+    const s = await start();
+    const res = await s.inject({
+      method: 'POST',
+      url: '/api/feedback',
+      headers: { 'content-type': 'application/json' },
+      payload: '{"content": "unterminated',
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe('bad_request');
+  });
+
+  it('still returns 500 for a genuine server fault', async () => {
+    const s = await start();
+    s.get('/boom', async () => {
+      throw new Error('a real bug, with a secret in the message');
+    });
+
+    const res = await s.inject({ method: 'GET', url: '/boom' });
+    expect(res.statusCode).toBe(500);
+    expect(res.json().error).toBe('internal_error');
+    // Internals stay out of the response body.
+    expect(res.payload).not.toContain('secret');
+  });
+
   it('lists feedback with its analysis, newest first, and filters by status', async () => {
     const s = await start();
 
