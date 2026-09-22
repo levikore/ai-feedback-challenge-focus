@@ -38,7 +38,7 @@ hit, a schema-validation failure, a manual retry, automatic retry of a transient
 failure, and the read API. It is the intended script for the screen recording.
 
 ```bash
-npm test                # 44 tests, no key required
+npm test                # 50 tests, no key required
 npm run typecheck
 ```
 
@@ -145,6 +145,7 @@ single conversion bug weaken both at once.
 | 429, 5xx, timeout, connection reset | Yes, up to `MAX_ANALYSIS_ATTEMPTS` with exponential backoff | A different outcome is plausible. |
 | Output fails schema validation | **No** — straight to `FAILED` | The prompt is deterministic. The same input yields the same bad shape; a retry burns tokens to reach the same conclusion more slowly. Fixing it needs a prompt or schema change, which is a deploy. |
 | 401 / 403 / 400 / 404 | No | A human has to fix the credential or the request. |
+| Output truncated by `max_tokens` | No | Retrying the identical request truncates identically. Kept distinct from a schema failure because the fix is different: raise `ANTHROPIC_MAX_TOKENS`, rather than go hunting for a bug in the prompt. |
 
 A **manual** retry via the API resets the attempt counter, so it gets a full
 budget rather than a single shot. Pressing "retry" is a deliberate act by someone
@@ -222,6 +223,9 @@ different project.
 - **Composition root in [`src/app.ts`](src/app.ts)**: no module-level
   singletons, which is exactly why a test can stand up a complete isolated
   application against an in-memory database in three lines.
+- **Backoff timers are not `unref`'d.** A pending retry is real outstanding work
+  and keeps the process alive, exactly as an in-flight job does. It cannot delay
+  shutdown, because `drain()` clears those timers rather than awaiting them.
 
 ---
 
@@ -235,7 +239,7 @@ Conscious omissions, not oversights:
 | Durable queue | In-process, which the brief permits. The DB-as-source-of-truth design is what keeps the swap to SQS/Redis cheap. |
 | Auth, rate limiting, deployment | Explicitly out of scope per the brief. |
 | Structured log shipping, metrics | Fastify's logger only. `analysis_attempts` already holds the latency and failure data a dashboard would need. |
-| Exhaustive tests | 44 tests aimed at what carries risk — the state machine, the schema gate, the failure taxonomy, the guardrail. The brief says coverage is not graded, so I spent the budget on the paths where a bug would be silent. |
+| Exhaustive tests | 50 tests aimed at what carries risk — the state machine, the schema gate, the failure taxonomy, the guardrail. The brief says coverage is not graded, so I spent the budget on the paths where a bug would be silent. |
 | Dead-letter handling beyond `FAILED` | `FAILED` + an explicit retry endpoint covers the requirement. A real system would alert on the `FAILED` count. |
 
 ## What I would do with more time

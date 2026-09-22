@@ -118,8 +118,17 @@ issues, reproduced six, and three were real bugs the suite had sailed past:
    a lifetime cap, but undocumented and untested, and not what an operator
    pressing "retry" after a rate-limit window expects.
 
-All three now have regression tests that fail against the old code — the suite
-is 44 tests because of this pass, not 39.
+Two further findings I fixed in the same pass: backoff timers were `unref`'d, so
+a process whose only outstanding work was a pending retry exited before the retry
+fired (masked in the server by the listening socket, but silent data loss for any
+other consumer); and the provider never checked `stop_reason`, so a response cut
+off by the token ceiling was treated as complete.
+
+All five now have regression tests that fail against the old code — the suite is
+50 tests because of this pass, not 39. The `unref` one runs the queue in a child
+process with nothing else holding the event loop open, which is the only way to
+reproduce it; I verified it produces no output against the old code before
+keeping it.
 
 **What I take from it:** a passing suite describes the paths someone thought to
 write, and the AI that wrote the tests had the same blind spot as the AI that
@@ -178,5 +187,5 @@ The one I would do first is the **golden-set eval**. Right now every claim about
 analysis *quality* rests on eyeballing a handful of outputs. The structure around
 the model is tested; the model's actual judgment is not measured at all. That is
 the largest untested surface in the project, and I would rather say so than let
-44 green tests imply otherwise — especially having just watched 39 green tests
-sit on top of three real bugs.
+50 green tests imply otherwise — especially having just watched 39 green tests
+sit on top of five real bugs.
