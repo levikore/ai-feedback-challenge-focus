@@ -89,6 +89,46 @@ about the backoff schedule.
 optimizes for green, and green is available from either side of the assertion.
 Deciding *which* side is wrong is not something I could delegate.
 
+### The second one that mattered: green tests hid three real bugs
+
+With everything built and 39 tests passing, I had the AI review its own diff as
+a senior engineer would, with one constraint:
+
+> Every finding needs a concrete failure scenario, and you must reproduce it
+> before reporting it. No style opinions, no "consider using". If you cannot
+> make it fail, say so and mark it unverified.
+
+Forcing reproduction over assertion is what made this useful. It found seven
+issues, reproduced six, and three were real bugs the suite had sailed past:
+
+1. **The guardrail didn't work under load.** `findCacheSource` only matches
+   `DONE` rows, so duplicates arriving while the first analysis was still
+   running each bought their own model call. Measured against a 300ms provider:
+   six identical submissions, six LLM calls. The suite never caught it because
+   `FakeProvider` returns instantly, so in tests the first item was always
+   already `DONE` — the guardrail's headline benefit was absent in exactly the
+   burst case it exists for. Fixed with a leader/follower fan-out; the same
+   burst now costs one call.
+2. **Malformed JSON returned 500 instead of 400.** The error handler flattened
+   every error to 500, discarding the `statusCode` Fastify attaches to its own
+   parse errors — telling a client with a serialization bug that the server was
+   broken, and inviting any retry-on-5xx policy to retry forever.
+3. **Manual retry didn't reset the attempt budget.** An item that had exhausted
+   three attempts got exactly one shot per retry, with no backoff. Defensible as
+   a lifetime cap, but undocumented and untested, and not what an operator
+   pressing "retry" after a rate-limit window expects.
+
+All three now have regression tests that fail against the old code — the suite
+is 44 tests because of this pass, not 39.
+
+**What I take from it:** a passing suite describes the paths someone thought to
+write, and the AI that wrote the tests had the same blind spot as the AI that
+wrote the code — both assumed an instant provider. The review only found the
+guardrail bug because I made reproduction mandatory, which forced it to stand up
+a *slow* provider and actually count the calls. Asking an AI to "review this
+code" gets you plausible-sounding observations; asking it to prove each one gets
+you bugs.
+
 ### Two smaller ones
 
 **A race in the retry response.** `retry()` enqueued the item and *then* read the
@@ -138,4 +178,5 @@ The one I would do first is the **golden-set eval**. Right now every claim about
 analysis *quality* rests on eyeballing a handful of outputs. The structure around
 the model is tested; the model's actual judgment is not measured at all. That is
 the largest untested surface in the project, and I would rather say so than let
-39 green tests imply otherwise.
+44 green tests imply otherwise — especially having just watched 39 green tests
+sit on top of three real bugs.

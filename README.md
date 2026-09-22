@@ -38,7 +38,7 @@ hit, a schema-validation failure, a manual retry, automatic retry of a transient
 failure, and the read API. It is the intended script for the screen recording.
 
 ```bash
-npm test                # 39 tests, no key required
+npm test                # 44 tests, no key required
 npm run typecheck
 ```
 
@@ -146,6 +146,12 @@ single conversion bug weaken both at once.
 | Output fails schema validation | **No** — straight to `FAILED` | The prompt is deterministic. The same input yields the same bad shape; a retry burns tokens to reach the same conclusion more slowly. Fixing it needs a prompt or schema change, which is a deploy. |
 | 401 / 403 / 400 / 404 | No | A human has to fix the credential or the request. |
 
+A **manual** retry via the API resets the attempt counter, so it gets a full
+budget rather than a single shot. Pressing "retry" is a deliberate act by someone
+who has usually just fixed something — waited out a rate-limit window, restored a
+credential — and carrying the exhausted counter across would make that retry mean
+something different from what the operator intends.
+
 That distinction is the point of the error taxonomy in
 [`src/ai/provider.ts`](src/ai/provider.ts), and it is why `ProviderError` carries
 a `kind` rather than just a message.
@@ -163,7 +169,25 @@ hashed with SHA-256. If an earlier item with the same hash already has a
 validated analysis, the result is copied onto the new row, which goes straight to
 `DONE` — **no model call, no spend**.
 
-Three judgment calls worth naming:
+**A cache alone is not enough.** The lookup above only matches items that have
+already reached `DONE`, so duplicates arriving *while the first analysis is
+still running* would each buy their own call — and against a real model that
+window is seconds wide, which is exactly when a burst of identical feedback
+turns up. So submissions also check for an in-flight identical item:
+
+- the first copy is the **leader** and is queued normally;
+- later copies become **followers** — persisted, left `RECEIVED`, deliberately
+  *not* queued;
+- when the leader finishes, its analysis is fanned out to every follower, which
+  go straight to `DONE` with `from_cache = 1`;
+- if the leader *fails*, exactly one follower is promoted to leader and requeued.
+  One at a time, not all of them, so a bad input degrades attempt by attempt
+  instead of stampeding the provider.
+
+Measured: six identical submissions against a 300ms provider cost **one** model
+call. Before the fan-out they cost six.
+
+Three further judgment calls worth naming:
 
 - **The new submission row is still created**, not collapsed into the original.
   Each submission is a real event with its own identity and timestamp; returning
@@ -211,7 +235,7 @@ Conscious omissions, not oversights:
 | Durable queue | In-process, which the brief permits. The DB-as-source-of-truth design is what keeps the swap to SQS/Redis cheap. |
 | Auth, rate limiting, deployment | Explicitly out of scope per the brief. |
 | Structured log shipping, metrics | Fastify's logger only. `analysis_attempts` already holds the latency and failure data a dashboard would need. |
-| Exhaustive tests | 39 tests aimed at what carries risk — the state machine, the schema gate, the failure taxonomy, the guardrail. The brief says coverage is not graded, so I spent the budget on the paths where a bug would be silent. |
+| Exhaustive tests | 44 tests aimed at what carries risk — the state machine, the schema gate, the failure taxonomy, the guardrail. The brief says coverage is not graded, so I spent the budget on the paths where a bug would be silent. |
 | Dead-letter handling beyond `FAILED` | `FAILED` + an explicit retry endpoint covers the requirement. A real system would alert on the `FAILED` count. |
 
 ## What I would do with more time
